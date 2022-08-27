@@ -1,16 +1,91 @@
-#![allow(proc_macro_derive_resolution_fallback)]
+// Copyright 2022 The casbin Authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use actix_web::{get, web, App, HttpServer, Responder};
+use actix_web::{middleware, web, App, HttpResponse, HttpServer, Responder};
+use diesel_adapter::casbin::prelude::*;
+use diesel_adapter::DieselAdapter;
+use serde::Deserialize;
+use std::env;
 
-#[get("/hello")]
-async fn greet(name: web::Path<String>) -> impl Responder {
-    format!("This is {}!", name)
+#[derive(Deserialize)]
+pub struct Visitor {
+    name: String,
 }
 
-#[actix_web::main] // or #[tokio::main]
+#[actix_rt::main]
 async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| App::new().service(greet))
-        .bind(("127.0.0.1", 8080))?
+    dotenv::dotenv().ok();
+    env_logger::init();
+
+    let mut enforcer = get_enforcer().await;
+    enforcer
+        .add_policy(
+            vec!["casbin", "index", "read"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    let app = move || {
+        App::new()
+            .wrap(middleware::Logger::default())
+            .route("/", web::get().to(index))
+    };
+
+    // Start HTTP server
+    let bind_address = env::var("BIND_ADDRESS").expect("BIND_ADDRESS is not set");
+
+    HttpServer::new(app)
+        .bind(&bind_address)
+        .unwrap_or_else(|_| panic!("Cannot bind address to {}", &bind_address))
         .run()
         .await
+}
+
+async fn index(me: web::Query<Visitor>) -> impl Responder {
+    if grant(&me.name, "index", "read").await.is_err() {
+        return HttpResponse::Forbidden().body("Forbidden");
+    };
+
+    HttpResponse::Ok().body("OK")
+}
+
+async fn grant(sub: &str, obj: &str, act: &str) -> Result<()> {
+    let e = get_enforcer().await;
+
+    if let Ok(authorized) = e.enforce((sub, obj, act)) {
+        if authorized {
+            Ok(())
+        } else {
+            Err(()).unwrap()
+        }
+    } else {
+        Err(()).unwrap()
+    }
+}
+
+async fn get_enforcer() -> Enforcer {
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool_size: u32 = std::env::var("POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let m = DefaultModel::from_file("model/rbac_model.conf")
+        .await
+        .unwrap();
+    let a = DieselAdapter::new(database_url, pool_size).unwrap();
+    Enforcer::new(m, a).await.unwrap()
 }
